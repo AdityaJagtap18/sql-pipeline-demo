@@ -23,61 +23,46 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Get changed SQL files
-        id: changed-files
-        shell: powershell
-        run: |
-          $base = "${{ github.event.before }}"
-          $head = "${{ github.sha }}"
-          $files = git diff --name-only $base $head -- '*.sql'
-          $fileList = $files -join " "
-          echo "files=$fileList" >> $env:GITHUB_OUTPUT
-          Write-Host "Changed SQL files: $fileList"
-
       - name: Run SQL scripts
         id: run-sql
         shell: powershell
         run: |
-          $sqlFiles = "${{ steps.changed-files.outputs.files }}" -split " " | Where-Object { $_ -ne "" }
-          $errors = ""
-          $successFiles = ""
-
-          if ($sqlFiles.Count -eq 0) {
+          $changedFiles = git diff --name-only $env:GITHUB_SHA~ $env:GITHUB_SHA -- '*.sql'
+          if (-not $changedFiles) {
             Write-Host "No SQL files changed. Skipping."
-            echo "status=skipped" >> $env:GITHUB_OUTPUT
+            "status=skipped" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
             exit 0
           }
 
-          foreach ($file in $sqlFiles) {
+          $errors = ""
+          $successFiles = ""
+
+          foreach ($file in $changedFiles) {
             if (-not (Test-Path $file)) {
               Write-Host "File not found: $file"
               continue
             }
             Write-Host "Running: $file"
-	    $output = & sqlplus -S "dev_user/Welcome123@localhost:1521/FREEPDB1" "@$file" 2>&1            
-            $output = $output -join "`n"
-            Write-Host $output
+            $output = & sqlplus -S "dev_user/Welcome123@localhost:1521/FREEPDB1" "@$file" 2>&1
+            $outputStr = $output -join "`n"
+            Write-Host $outputStr
 
-            if ($output -match "ORA-|SP2-0|ERROR") {
-              $errors += "FAILED: $file`n$output`n"
+            if ($outputStr -match "ORA-|SP2-0|ERROR") {
+              $errors += "FAILED: $file`n$outputStr`n"
             } else {
               $successFiles += "SUCCESS: $file`n"
               Write-Host "SUCCESS: $file"
             }
           }
 
-          echo "errors<<EOF" >> $env:GITHUB_OUTPUT
-          echo "$errors" >> $env:GITHUB_OUTPUT
-          echo "EOF" >> $env:GITHUB_OUTPUT
-          echo "success_files<<EOF" >> $env:GITHUB_OUTPUT
-          echo "$successFiles" >> $env:GITHUB_OUTPUT
-          echo "EOF" >> $env:GITHUB_OUTPUT
+          "errors<<EOF`n$errors`nEOF" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "success_files<<EOF`n$successFiles`nEOF" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
           if ($errors -ne "") {
-            echo "status=failure" >> $env:GITHUB_OUTPUT
+            "status=failure" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
             exit 1
           } else {
-            echo "status=success" >> $env:GITHUB_OUTPUT
+            "status=success" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           }
 
       - name: Post success comment
@@ -85,26 +70,12 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const successFiles = `${{ steps.run-sql.outputs.success_files }}`;
             const sha = context.sha.substring(0, 7);
-            const body = [
-              `## ✅ SQL Pipeline — Passed`,
-              `**Commit:** \`${sha}\``,
-              `**Branch:** \`${context.ref.replace('refs/heads/', '')}\``,
-              `### Files executed successfully:`,
-              successFiles,
-              `> Oracle DB updated. Triggering merge to \`uat\`...`
-            ].join('\n');
+            const body = `## ✅ SQL Pipeline — Passed\n**Commit:** \`${sha}\`\n**Branch:** \`${context.ref.replace('refs/heads/', '')}\`\n\n${{ steps.run-sql.outputs.success_files }}\n\n> Oracle DB updated. Triggering merge to \`uat\`...`;
             if (context.payload.pull_request) {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner, repo: context.repo.repo,
-                issue_number: context.payload.pull_request.number, body
-              });
+              await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: context.payload.pull_request.number, body });
             } else {
-              await github.rest.repos.createCommitComment({
-                owner: context.repo.owner, repo: context.repo.repo,
-                commit_sha: context.sha, body
-              });
+              await github.rest.repos.createCommitComment({ owner: context.repo.owner, repo: context.repo.repo, commit_sha: context.sha, body });
             }
 
       - name: Post failure comment
@@ -112,26 +83,12 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const errors = `${{ steps.run-sql.outputs.errors }}`;
             const sha = context.sha.substring(0, 7);
-            const body = [
-              `## ❌ SQL Pipeline — Failed`,
-              `**Commit:** \`${sha}\``,
-              `**Branch:** \`${context.ref.replace('refs/heads/', '')}\``,
-              `### Errors found:`,
-              errors,
-              `> ⚠️ Database was NOT updated. Fix the errors and push again.`
-            ].join('\n');
+            const body = `## ❌ SQL Pipeline — Failed\n**Commit:** \`${sha}\`\n**Branch:** \`${context.ref.replace('refs/heads/', '')}\`\n\n${{ steps.run-sql.outputs.errors }}\n\n> ⚠️ Database was NOT updated. Fix the errors and push again.`;
             if (context.payload.pull_request) {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner, repo: context.repo.repo,
-                issue_number: context.payload.pull_request.number, body
-              });
+              await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: context.payload.pull_request.number, body });
             } else {
-              await github.rest.repos.createCommitComment({
-                owner: context.repo.owner, repo: context.repo.repo,
-                commit_sha: context.sha, body
-              });
+              await github.rest.repos.createCommitComment({ owner: context.repo.owner, repo: context.repo.repo, commit_sha: context.sha, body });
             }
 
   merge-to-uat:
@@ -148,7 +105,6 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Merge dev into uat
-        id: merge
         shell: powershell
         run: |
           git config user.name "github-actions[bot]"
@@ -157,26 +113,17 @@ jobs:
           git checkout uat
           git merge origin/dev --no-ff -m "chore: auto-merge dev to uat [skip ci]"
           git push origin uat
-          echo "status=success" >> $env:GITHUB_OUTPUT
 
       - name: Post merge success comment
         if: success()
         uses: actions/github-script@v7
         with:
           script: |
-            await github.rest.repos.createCommitComment({
-              owner: context.repo.owner, repo: context.repo.repo,
-              commit_sha: context.sha,
-              body: `## 🔀 Merge Successful — \`dev\` → \`uat\`\n\nSQL validation passed and \`uat\` has been automatically updated.`
-            });
+            await github.rest.repos.createCommitComment({ owner: context.repo.owner, repo: context.repo.repo, commit_sha: context.sha, body: `## 🔀 Merge Successful — \`dev\` → \`uat\`\n\nSQL validation passed and \`uat\` has been automatically updated.` });
 
       - name: Post merge failure comment
         if: failure()
         uses: actions/github-script@v7
         with:
           script: |
-            await github.rest.repos.createCommitComment({
-              owner: context.repo.owner, repo: context.repo.repo,
-              commit_sha: context.sha,
-              body: `## ⚠️ Merge Failed — \`dev\` → \`uat\`\n\nSQL passed but auto-merge failed. Please merge manually.`
-            });
+            await github.rest.repos.createCommitComment({ owner: context.repo.owner, repo: context.repo.repo, commit_sha: context.sha, body: `## ⚠️ Merge Failed — \`dev\` → \`uat\`\n\nSQL passed but auto-merge failed. Please merge manually.` });
