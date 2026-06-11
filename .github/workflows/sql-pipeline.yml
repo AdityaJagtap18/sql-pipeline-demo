@@ -1,0 +1,133 @@
+name: SQL CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - dev
+    paths:
+      - '**.sql'
+  pull_request:
+    branches:
+      - dev
+    paths:
+      - '**.sql'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  validate-and-deploy:
+    name: Validate & Deploy SQL
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run SQL scripts
+        id: run-sql
+        shell: powershell
+        run: |
+          $changedFiles = git diff --name-only $env:GITHUB_SHA~ $env:GITHUB_SHA -- '*.sql'
+          if (-not $changedFiles) {
+            Write-Host "No SQL files changed. Skipping."
+            "status=skipped" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            exit 0
+          }
+
+          $errors = ""
+          $successFiles = ""
+
+          foreach ($file in $changedFiles) {
+            if (-not (Test-Path $file)) {
+              Write-Host "File not found: $file"
+              continue
+            }
+            Write-Host "Running: $file"
+            $output = & sqlplus -S "dev_user/Welcome123@localhost:1521/FREEPDB1" "@$file" 2>&1
+            $outputStr = $output -join "`n"
+            Write-Host $outputStr
+
+            if ($outputStr -match "ORA-|SP2-0|ERROR") {
+              $errors += "FAILED: $file`n$outputStr`n"
+            } else {
+              $successFiles += "SUCCESS: $file`n"
+              Write-Host "SUCCESS: $file"
+            }
+          }
+
+          "errors<<EOF`n$errors`nEOF" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "success_files<<EOF`n$successFiles`nEOF" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+          if ($errors -ne "") {
+            "status=failure" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            exit 1
+          } else {
+            "status=success" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+
+      - name: Post success comment
+        if: steps.run-sql.outputs.status == 'success'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const sha = context.sha.substring(0, 7);
+            const body = `## ✅ SQL Pipeline — Passed\n**Commit:** \`${sha}\`\n**Branch:** \`${context.ref.replace('refs/heads/', '')}\`\n\n${{ steps.run-sql.outputs.success_files }}\n\n> Oracle DB updated. Triggering merge to \`uat\`...`;
+            if (context.payload.pull_request) {
+              await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: context.payload.pull_request.number, body });
+            } else {
+              await github.rest.repos.createCommitComment({ owner: context.repo.owner, repo: context.repo.repo, commit_sha: context.sha, body });
+            }
+
+      - name: Post failure comment
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const sha = context.sha.substring(0, 7);
+            const body = `## ❌ SQL Pipeline — Failed\n**Commit:** \`${sha}\`\n**Branch:** \`${context.ref.replace('refs/heads/', '')}\`\n\n${{ steps.run-sql.outputs.errors }}\n\n> ⚠️ Database was NOT updated. Fix the errors and push again.`;
+            if (context.payload.pull_request) {
+              await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: context.payload.pull_request.number, body });
+            } else {
+              await github.rest.repos.createCommitComment({ owner: context.repo.owner, repo: context.repo.repo, commit_sha: context.sha, body });
+            }
+
+  merge-to-uat:
+    name: Merge dev to uat
+    runs-on: self-hosted
+    needs: validate-and-deploy
+    if: success() && github.ref == 'refs/heads/dev' && github.event_name == 'push'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge dev into uat
+        shell: powershell
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin
+          git checkout uat
+          git merge origin/dev --no-ff -m "chore: auto-merge dev to uat [skip ci]"
+          git push origin uat
+
+      - name: Post merge success comment
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createCommitComment({ owner: context.repo.owner, repo: context.repo.repo, commit_sha: context.sha, body: `## 🔀 Merge Successful — \`dev\` → \`uat\`\n\nSQL validation passed and \`uat\` has been automatically updated.` });
+
+      - name: Post merge failure comment
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createCommitComment({ owner: context.repo.owner, repo: context.repo.repo, commit_sha: context.sha, body: `## ⚠️ Merge Failed — \`dev\` → \`uat\`\n\nSQL passed but auto-merge failed. Please merge manually.` });
