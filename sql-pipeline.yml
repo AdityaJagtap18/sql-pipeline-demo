@@ -1,0 +1,288 @@
+name: SQL CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - dev
+    paths:
+      - '**.sql'
+  pull_request:
+    branches:
+      - dev
+    paths:
+      - '**.sql'
+
+jobs:
+  # ─────────────────────────────────────────
+  # JOB 1: Validate & Run SQL on Oracle DB
+  # ─────────────────────────────────────────
+  validate-and-deploy:
+    name: Validate & Deploy SQL
+    runs-on: ubuntu-latest
+
+    # Oracle DB service container (empty DB, no tables/data)
+    services:
+      oracle:
+        image: gvenzl/oracle-free:latest
+        env:
+          ORACLE_PASSWORD: ${{ secrets.root }}
+          APP_USER: ${{ secrets.dev_user }}
+          APP_USER_PASSWORD: ${{ secrets.Welcome123 }}
+        ports:
+          - 1521:1521
+        options: >-
+          --health-cmd "healthcheck.sh"
+          --health-interval 20s
+          --health-timeout 10s
+          --health-retries 10
+
+    steps:
+      # 1. Checkout code
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 2. Find changed SQL files
+      - name: Get changed SQL files
+        id: changed-files
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE=${{ github.event.pull_request.base.sha }}
+          else
+            BASE=${{ github.event.before }}
+          fi
+
+          CHANGED=$(git diff --name-only $BASE ${{ github.sha }} -- '*.sql' | tr '\n' ' ')
+          echo "files=$CHANGED" >> $GITHUB_OUTPUT
+          echo "Changed SQL files: $CHANGED"
+
+      # 3. Install Oracle SQL*Plus client
+      - name: Install SQL*Plus
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libaio1 wget unzip
+
+          # Download Oracle Instant Client (Basic + SQLPlus)
+          wget -q https://download.oracle.com/otn_software/linux/instantclient/2370000/instantclient-basic-linux.x64-23.7.0.0.0dbru.zip
+          wget -q https://download.oracle.com/otn_software/linux/instantclient/2370000/instantclient-sqlplus-linux.x64-23.7.0.0.0dbru.zip
+
+          sudo mkdir -p /opt/oracle
+          sudo unzip -q instantclient-basic-linux.x64-23.7.0.0.0dbru.zip  -d /opt/oracle/
+          sudo unzip -q instantclient-sqlplus-linux.x64-23.7.0.0.0dbru.zip -d /opt/oracle/
+
+          IC_DIR=$(ls -d /opt/oracle/instantclient_*)
+          echo "export LD_LIBRARY_PATH=$IC_DIR:\$LD_LIBRARY_PATH" >> $GITHUB_ENV
+          echo "export PATH=$IC_DIR:\$PATH" >> $GITHUB_ENV
+          echo "$IC_DIR" >> $GITHUB_PATH
+          echo "LD_LIBRARY_PATH=$IC_DIR" >> $GITHUB_ENV
+
+      # 4. Wait for Oracle to be ready
+      - name: Wait for Oracle DB
+        run: |
+          echo "Waiting for Oracle to be ready..."
+          for i in $(seq 1 30); do
+            if sqlplus -S ${{ secrets.ORACLE_USER }}/${{ secrets.ORACLE_USER_PASSWORD }}@localhost:1521/FREEPDB1 <<< "EXIT" 2>&1 | grep -q "Connected"; then
+              echo "Oracle is ready!"
+              break
+            fi
+            echo "Attempt $i/30 — Oracle not ready yet, waiting 10s..."
+            sleep 10
+          done
+
+      # 5. Validate & Execute each SQL file
+      - name: Run SQL scripts
+        id: run-sql
+        run: |
+          set +e  # Don't exit on error — we catch it manually
+
+          SQL_FILES="${{ steps.changed-files.outputs.files }}"
+          ERRORS=""
+          SUCCESS_FILES=""
+
+          if [ -z "$SQL_FILES" ]; then
+            echo "No SQL files changed. Skipping."
+            echo "status=skipped" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          for SQL_FILE in $SQL_FILES; do
+            if [ ! -f "$SQL_FILE" ]; then
+              echo "⚠️  File not found (possibly deleted): $SQL_FILE"
+              continue
+            fi
+
+            echo "──────────────────────────────"
+            echo "▶ Running: $SQL_FILE"
+            echo "──────────────────────────────"
+
+            OUTPUT=$(sqlplus -S ${{ secrets.ORACLE_USER }}/${{ secrets.ORACLE_USER_PASSWORD }}@localhost:1521/FREEPDB1 @"$SQL_FILE" 2>&1)
+            EXIT_CODE=$?
+
+            echo "$OUTPUT"
+
+            # Check for Oracle errors in output (ORA- errors)
+            if echo "$OUTPUT" | grep -qE "ORA-|SP2-|ERROR"; then
+              ERRORS="$ERRORS\n❌ **$SQL_FILE** failed:\n\`\`\`\n$OUTPUT\n\`\`\`"
+            elif [ $EXIT_CODE -ne 0 ]; then
+              ERRORS="$ERRORS\n❌ **$SQL_FILE** failed with exit code $EXIT_CODE:\n\`\`\`\n$OUTPUT\n\`\`\`"
+            else
+              SUCCESS_FILES="$SUCCESS_FILES\n✅ $SQL_FILE"
+              echo "✅ $SQL_FILE — SUCCESS"
+            fi
+          done
+
+          # Save outputs for comment step
+          echo "errors<<EOF" >> $GITHUB_OUTPUT
+          echo -e "$ERRORS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          echo "success_files<<EOF" >> $GITHUB_OUTPUT
+          echo -e "$SUCCESS_FILES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          if [ -n "$ERRORS" ]; then
+            echo "status=failure" >> $GITHUB_OUTPUT
+            exit 1
+          else
+            echo "status=success" >> $GITHUB_OUTPUT
+          fi
+
+      # 6a. Comment on PR/commit — SUCCESS
+      - name: Post success comment
+        if: steps.run-sql.outputs.status == 'success'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const successFiles = `${{ steps.run-sql.outputs.success_files }}`;
+            const sha = context.sha.substring(0, 7);
+            const body = [
+              `## ✅ SQL Pipeline — Passed`,
+              `**Commit:** \`${sha}\``,
+              `**Branch:** \`${context.ref.replace('refs/heads/', '')}\``,
+              ``,
+              `### Files executed successfully:`,
+              successFiles,
+              ``,
+              `> Oracle DB updated. Triggering merge to \`uat\`...`
+            ].join('\n');
+
+            if (context.payload.pull_request) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body
+              });
+            } else {
+              await github.rest.repos.createCommitComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                commit_sha: context.sha,
+                body
+              });
+            }
+
+      # 6b. Comment on PR/commit — FAILURE
+      - name: Post failure comment
+        if: failure() && steps.run-sql.outputs.status == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const errors = `${{ steps.run-sql.outputs.errors }}`;
+            const sha = context.sha.substring(0, 7);
+            const body = [
+              `## ❌ SQL Pipeline — Failed`,
+              `**Commit:** \`${sha}\``,
+              `**Branch:** \`${context.ref.replace('refs/heads/', '')}\``,
+              ``,
+              `### Errors found:`,
+              errors,
+              ``,
+              `> ⚠️ Database was **not** updated. Fix the errors above and push again.`
+            ].join('\n');
+
+            if (context.payload.pull_request) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body
+              });
+            } else {
+              await github.rest.repos.createCommitComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                commit_sha: context.sha,
+                body
+              });
+            }
+
+  # ─────────────────────────────────────────
+  # JOB 2: Merge dev → uat (only on success)
+  # ─────────────────────────────────────────
+  merge-to-uat:
+    name: Merge dev → uat
+    runs-on: ubuntu-latest
+    needs: validate-and-deploy
+    if: success() && github.ref == 'refs/heads/dev' && github.event_name == 'push'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Merge dev into uat
+        id: merge
+        run: |
+          git fetch origin
+          git checkout uat || git checkout -b uat origin/uat || git checkout -b uat
+
+          git merge origin/dev --no-ff -m "chore: auto-merge dev → uat after SQL validation [skip ci]"
+          git push origin uat
+
+          echo "status=success" >> $GITHUB_OUTPUT
+
+      - name: Post merge success comment
+        if: steps.merge.outputs.status == 'success'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const sha = context.sha.substring(0, 7);
+            await github.rest.repos.createCommitComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              commit_sha: context.sha,
+              body: [
+                `## 🔀 Merge Successful — \`dev\` → \`uat\``,
+                `**Commit:** \`${sha}\``,
+                ``,
+                `SQL validation passed and the \`uat\` branch has been automatically updated.`
+              ].join('\n')
+            });
+
+      - name: Post merge failure comment
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const sha = context.sha.substring(0, 7);
+            await github.rest.repos.createCommitComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              commit_sha: context.sha,
+              body: [
+                `## ⚠️ Merge Failed — \`dev\` → \`uat\``,
+                `**Commit:** \`${sha}\``,
+                ``,
+                `SQL validation passed but the auto-merge to \`uat\` failed.`,
+                `Please merge manually or check for conflicts.`
+              ].join('\n')
+            });
