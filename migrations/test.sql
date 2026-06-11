@@ -7,3 +7,4 @@ CREATE TABLE test_table (
 EXIT;
 "@-- test run
 -- permissions fix test
+-- execution policy fix
